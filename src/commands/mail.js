@@ -1,6 +1,6 @@
 // /mail send    - send to one nation (ID, name, or link)
 // /mail multi   - send to multiple nations (comma-separated IDs/names/links)
-// /mail alliance - send to ALL members of an alliance (name or ID)
+// /mail alliance - send to ALL members of an alliance (name or ID), with optional city filter
 // /mail history  - view mail history with a nation
 
 const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
@@ -12,8 +12,8 @@ const { truncateForDiscord } = require('../utils/discordText');
 const { canSendRecruitmentMail } = require('../utils/permissions');
 
 // Safety caps for multi/alliance sends
-const DELAY_MS = 2000;       // 2 seconds between each mail
-const MAX_PER_RUN = 50;      // hard cap per command invocation
+const DELAY_MS = 2000;
+const MAX_PER_RUN = 50;
 
 function fillTemplate(text, nation) {
   return text
@@ -27,11 +27,6 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/**
- * Shared logic for sending mail to a list of nations, logging each one,
- * and posting to their recruit thread. Used by both /mail multi and
- * /mail alliance to avoid duplicating code.
- */
 async function sendToList(nations, rawSubject, rawMessage, interaction, label) {
   const personalKey = db.getPersonalApiKey(interaction.user.id);
   let sent = 0;
@@ -133,7 +128,7 @@ module.exports = {
     .addSubcommand((sub) =>
       sub
         .setName('alliance')
-        .setDescription('Send mail to ALL current members of an alliance')
+        .setDescription('Send mail to members of an alliance, with optional city count filter')
         .addStringOption((opt) =>
           opt.setName('alliance').setDescription('Alliance name or numeric ID').setRequired(true)
         )
@@ -142,6 +137,12 @@ module.exports = {
         )
         .addStringOption((opt) =>
           opt.setName('message').setDescription('Mail message. Use {nation}, {leader} as placeholders.').setRequired(true)
+        )
+        .addIntegerOption((opt) =>
+          opt.setName('cities-min').setDescription('Only mail members with at least this many cities').setRequired(false)
+        )
+        .addIntegerOption((opt) =>
+          opt.setName('cities-max').setDescription('Only mail members with at most this many cities').setRequired(false)
         )
         .addBooleanOption((opt) =>
           opt
@@ -233,7 +234,6 @@ module.exports = {
       const rawSubject = interaction.options.getString('subject');
       const rawMessage = interaction.options.getString('message');
 
-      // Split on commas, trim whitespace, drop any empty entries
       const inputs = interaction.options
         .getString('nations')
         .split(',')
@@ -245,7 +245,6 @@ module.exports = {
         return interaction.editReply(`❌ Too many nations (${inputs.length}). Max ${MAX_PER_RUN} per command.`);
       }
 
-      // Resolve all inputs in parallel
       await interaction.editReply(`🔍 Looking up ${inputs.length} nation(s)...`);
       const resolved = await Promise.allSettled(inputs.map((i) => resolveNation(i)));
 
@@ -278,6 +277,8 @@ module.exports = {
       const allianceInput = interaction.options.getString('alliance');
       const rawSubject = interaction.options.getString('subject');
       const rawMessage = interaction.options.getString('message');
+      const citiesMin = interaction.options.getInteger('cities-min') ?? null;
+      const citiesMax = interaction.options.getInteger('cities-max') ?? null;
       const confirm = interaction.options.getBoolean('confirm') ?? false;
 
       await interaction.editReply(`🔍 Looking up alliance "${allianceInput}"...`);
@@ -301,24 +302,37 @@ module.exports = {
 
       if (members.length === 0) return interaction.editReply(`That alliance has no members.`);
 
-      const blacklistedCount = members.filter((m) => db.isBlacklisted(m.id)).length;
-      const eligible = members.filter((m) => !db.isBlacklisted(m.id));
+      // Apply city filter if specified
+      let filtered = members;
+      if (citiesMin !== null) filtered = filtered.filter((m) => Number(m.num_cities) >= citiesMin);
+      if (citiesMax !== null) filtered = filtered.filter((m) => Number(m.num_cities) <= citiesMax);
 
-      // Always show a dry-run first unless confirm:true
+      const blacklistedCount = filtered.filter((m) => db.isBlacklisted(m.id)).length;
+      const eligible = filtered.filter((m) => !db.isBlacklisted(m.id));
+
+      // Build a human-readable description of the city filter
+      let cityFilterDesc = 'None (all cities)';
+      if (citiesMin !== null && citiesMax !== null) cityFilterDesc = `${citiesMin}–${citiesMax} cities`;
+      else if (citiesMin !== null) cityFilterDesc = `${citiesMin}+ cities`;
+      else if (citiesMax !== null) cityFilterDesc = `up to ${citiesMax} cities`;
+
       if (!confirm) {
         return interaction.editReply(
           `🔍 **Dry run — ${alliance.name} (#${alliance.id})**\n\n` +
             `Total members: **${members.length}**\n` +
+            `City filter: **${cityFilterDesc}** → **${filtered.length}** member(s) match\n` +
             `Blacklisted (would be skipped): **${blacklistedCount}**\n` +
             `Eligible to receive mail: **${eligible.length}**\n` +
             `Safety cap: **${MAX_PER_RUN}** per run (${eligible.length > MAX_PER_RUN ? `first ${MAX_PER_RUN} would be mailed, rest need another run` : 'all would be mailed in one run'})\n` +
             `Delay between each mail: **${DELAY_MS / 1000}s**\n\n` +
-            `⚠️ This will mail members of **another alliance** — make sure this is intentional and permitted by your alliance's rules.\n\n` +
+            `⚠️ This will mail members of **another alliance** — make sure this is intentional.\n\n` +
             `Re-run with \`confirm:true\` to actually send.`
         );
       }
 
-      await interaction.editReply(`📨 Sending to ${eligible.length} member(s) of **${alliance.name}**... (this may take a while)`);
+      await interaction.editReply(
+        `📨 Sending to ${eligible.length} member(s) of **${alliance.name}**${citiesMin !== null || citiesMax !== null ? ` (${cityFilterDesc})` : ''}... (this may take a while)`
+      );
 
       const result = await sendToList(eligible, rawSubject, rawMessage, interaction, 'ALLIANCE MAIL SENT');
       return interaction.editReply(`**${alliance.name}** — ${result}`);
